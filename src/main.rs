@@ -3,10 +3,11 @@ use err_derive::Error;
 use gio::TlsAuthenticationMode;
 use log::*;
 use neolink::bc_protocol::BcCamera;
-use neolink::gst::{GstOutputs, RtspServer};
+use neolink::gst::{MaybeAppSrc, RtspServer, StreamFormat};
 use neolink::Never;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -19,7 +20,6 @@ use cmdline::Opt;
 use config::{CameraConfig, Config, UserConfig};
 
 #[derive(Debug, Error)]
-#[allow(clippy::large_enum_variant)]
 pub enum Error {
     #[error(display = "Configuration parsing error")]
     ConfigError(#[error(source)] toml::de::Error),
@@ -29,12 +29,10 @@ pub enum Error {
     IoError(#[error(source)] std::io::Error),
     #[error(display = "Validation error")]
     ValidationError(#[error(source)] validator::ValidationErrors),
-    #[error(display = "ADPCM Decoding Error")]
-    AdpcmDecodingError(&'static str),
 }
 
 fn main() -> Result<(), Error> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::from_env(Env::default().default_filter_or("info")).init();
 
     info!(
         "Neolink {} {}",
@@ -61,14 +59,22 @@ fn main() -> Result<(), Error> {
 
     crossbeam::scope(|s| {
         for camera in config.cameras {
-            if camera.format.is_some() {
-                warn!("The format config option of the camera has been removed in favour of auto detection.")
-            }
+            let stream_format = match &*camera.format {
+                "h264" | "H264" => StreamFormat::H264,
+                "h265" | "H265" => StreamFormat::H265,
+                custom_format => StreamFormat::Custom(custom_format.to_string()),
+            };
+
             // Let subthreads share the camera object; in principle I think they could share
             // the object as it sits in the config.cameras block, but I have not figured out the
             // syntax for that.
             let arc_cam = Arc::new(camera);
 
+            // The substream always seems to be H264, even on B800 cameras
+            let substream_format = match &*arc_cam.format {
+                "h264" | "H264" | "h265" | "H265" => StreamFormat::H264,
+                custom_format => StreamFormat::Custom(custom_format.to_string()),
+            };
             let permitted_users =
                 get_permitted_users(config.users.as_slice(), &arc_cam.permitted_users);
 
@@ -78,20 +84,20 @@ fn main() -> Result<(), Error> {
                     &*format!("/{}", arc_cam.name),
                     &*format!("/{}/mainStream", arc_cam.name),
                 ];
-                let mut outputs = rtsp
-                    .add_stream(paths, &permitted_users)
+                let mut output = rtsp
+                    .add_stream(paths, stream_format, &permitted_users)
                     .unwrap();
                 let main_camera = arc_cam.clone();
-                s.spawn(move |_| camera_loop(&*main_camera, "mainStream", &mut outputs, true));
+                s.spawn(move |_| camera_loop(&*main_camera, "mainStream", &mut output, true));
             }
             if ["both", "subStream"].iter().any(|&e| e == arc_cam.stream) {
                 let paths = &[&*format!("/{}/subStream", arc_cam.name)];
-                let mut outputs = rtsp
-                    .add_stream(paths, &permitted_users)
+                let mut output = rtsp
+                    .add_stream(paths, substream_format, &permitted_users)
                     .unwrap();
                 let sub_camera = arc_cam.clone();
                 let manage = arc_cam.stream == "subStream";
-                s.spawn(move |_| camera_loop(&*sub_camera, "subStream", &mut outputs, manage));
+                s.spawn(move |_| camera_loop(&*sub_camera, "subStream", &mut output, manage));
             }
         }
 
@@ -105,7 +111,7 @@ fn main() -> Result<(), Error> {
 fn camera_loop(
     camera_config: &CameraConfig,
     stream_name: &str,
-    outputs: &mut GstOutputs,
+    output: &mut MaybeAppSrc,
     manage: bool,
 ) -> Result<Never, Error> {
     let min_backoff = Duration::from_secs(1);
@@ -113,9 +119,8 @@ fn camera_loop(
     let mut current_backoff = min_backoff;
 
     loop {
-        let cam_err = camera_main(camera_config, stream_name, outputs, manage).unwrap_err();
-        outputs.vidsrc.on_stream_error();
-        outputs.audsrc.on_stream_error();
+        let cam_err = camera_main(camera_config, stream_name, output, manage).unwrap_err();
+        output.on_stream_error();
         // Authentication failures are permanent; we retry everything else
         if cam_err.connected {
             current_backoff = min_backoff;
@@ -194,12 +199,12 @@ fn get_permitted_users<'a>(
 fn camera_main(
     camera_config: &CameraConfig,
     stream_name: &str,
-    outputs: &mut GstOutputs,
+    output: &mut dyn Write,
     manage: bool,
 ) -> Result<Never, CameraErr> {
     let mut connected = false;
     (|| {
-        let mut camera = BcCamera::new_with_addr(&camera_config.camera_addr, camera_config.channel_id)?;
+        let mut camera = BcCamera::new_with_addr(camera_config.camera_addr)?;
         if camera_config.timeout.is_some() {
             warn!("The undocumented `timeout` config option has been removed and is no longer needed.");
             warn!("Please update your config file.");
@@ -209,6 +214,7 @@ fn camera_main(
             "{}: Connecting to camera at {}",
             camera_config.name, camera_config.camera_addr
         );
+        camera.connect()?;
 
         camera.login(&camera_config.username, camera_config.password.as_deref())?;
 
@@ -216,67 +222,36 @@ fn camera_main(
         info!("{}: Connected and logged in", camera_config.name);
 
         if manage {
-            do_camera_management(&mut camera, camera_config)?;
+            let cam_time = camera.get_time()?;
+            if let Some(time) = cam_time {
+                info!(
+                    "{}: Camera time is already set: {}",
+                    camera_config.name, time
+                );
+            } else {
+                let new_time = time::OffsetDateTime::now_local();
+                warn!(
+                    "{}: Camera has no time set, setting to {}",
+                    camera_config.name, new_time
+                );
+                camera.set_time(new_time)?;
+                let cam_time = camera.get_time()?;
+                if let Some(time) = cam_time {
+                    info!(
+                        "{}: Camera time is now set: {}",
+                        camera_config.name, time
+                    );
+                } else {
+                    error!("{}: Camera did not accept new time (is {} an admin?)", camera_config.name, camera_config.username);
+                }
+            }
         }
 
         info!(
             "{}: Starting video stream {}",
             camera_config.name, stream_name
         );
-        camera.start_video(outputs, stream_name)
+        camera.start_video(output, stream_name, camera_config.channel_id)
     })()
     .map_err(|err| CameraErr { connected, err })
-}
-
-fn do_camera_management(
-    camera: &mut BcCamera,
-    camera_config: &CameraConfig,
-) -> Result<(), neolink::Error> {
-    let cam_time = camera.get_time()?;
-    if let Some(time) = cam_time {
-        info!(
-            "{}: Camera time is already set: {}",
-            camera_config.name, time
-        );
-    } else {
-        use time::OffsetDateTime;
-        // We'd like now_local() but it's deprecated - try to get the local time, but if no
-        // time zone, fall back to UTC.
-        let new_time =
-            OffsetDateTime::try_now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-
-        warn!(
-            "{}: Camera has no time set, setting to {}",
-            camera_config.name, new_time
-        );
-        camera.set_time(new_time)?;
-        let cam_time = camera.get_time()?;
-        if let Some(time) = cam_time {
-            info!("{}: Camera time is now set: {}", camera_config.name, time);
-        } else {
-            error!(
-                "{}: Camera did not accept new time (is {} an admin?)",
-                camera_config.name, camera_config.username
-            );
-        }
-    }
-
-    use neolink::bc::xml::VersionInfo;
-    if let Ok(VersionInfo {
-        firmwareVersion: firmware_version,
-        ..
-    }) = camera.version()
-    {
-        info!(
-            "{}: Camera reports firmware version {}",
-            camera_config.name, firmware_version
-        );
-    } else {
-        info!(
-            "{}: Could not fetch version information",
-            camera_config.name
-        );
-    }
-
-    Ok(())
 }

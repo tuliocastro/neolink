@@ -15,7 +15,7 @@ unknown = ProtoField.int8("baichuan.unknown", "unknown", base.DEC)
 msg_handle = ProtoField.int8("baichuan.message_handle", "messageHandle", base.DEC)
 status_code = ProtoField.int16("baichuan.status_code", "status_code", base.DEC)
 message_class = ProtoField.int32("baichuan.msg_class", "messageClass", base.DEC)
-f_payload_offset = ProtoField.int32("baichuan.payload_offset", "binOffset", base.DEC)
+f_bin_offset = ProtoField.int32("baichuan.bin_offset", "binOffset", base.DEC)
 username = ProtoField.string("baichuan.username", "username", base.ASCII)
 password = ProtoField.string("baichuan.password", "password", base.ASCII)
 
@@ -31,7 +31,7 @@ bc_protocol.fields = {
   encrypt_xml,
   status_code,
   message_class,
-  f_payload_offset,
+  f_bin_offset,
   username,
   password,
 }
@@ -50,7 +50,6 @@ message_types = {
   [15]="<FileInfoList>",
   [16]="<FileInfoList>",
   [18]="<PtzControl>",
-  [23]="Reboot",
   [25]="<VideoInput> (write)",
   [26]="<VideoInput>", -- <InputAdvanceCfg>
   [31]="Start Motion Alarm",
@@ -79,7 +78,6 @@ message_types = {
   [59]="<UserList> (write)",
   [65]="<ConfigFileInfo> (Export)",
   [66]="<ConfigFileInfo> (Import)",
-  [67]="<ConfigFileInfo> (FW Upgrade)",
   [68]="<Ftp>",
   [69]="<Ftp> (write)",
   [70]="<FtpTask>",
@@ -98,11 +96,9 @@ message_types = {
   [93]="<LinkType>",
   [97]="<Upnp>",
   [98]="<Upnp> (write)",
-  [99]="<Restore> (factory default)",
   [100]="<AutoReboot> (write)",
   [101]="<AutoReboot>",
   [102]="<HDDInfoList>",
-  [103]="<HddInitList> (format)",
   [104]="<SystemGeneral>",
   [105]="<SystemGeneral> (write)",
   [106]="<Dst>",
@@ -127,9 +123,6 @@ message_types = {
   [209]="<LedState> (write)",
   [210]="<PTOP>",
   [211]="<PTOP> (write)",
-  [216]="<EmailTask> (write)",
-  [217]="<EmailTask>",
-  [218]="<PushTask> (write)",
   [219]="<PushTask>",
   [228]="<Crop>",
   [229]="<Crop> (write)",
@@ -165,12 +158,7 @@ end
 
 function get_header_len(buffer)
   local magic = buffer(0, 4):le_uint()
-  if magic == 0x0abcdef0 then
-    -- Client <-> BC
-  elseif magic == 0x0fedcba0 then
-    -- BC <-> BC
-  else
-    -- Unknown magic
+  if magic ~= 0x0abcdef0 then
     return -1 -- No header found
   end
   local header_len = header_lengths[buffer(18, 2):le_uint()]
@@ -187,7 +175,7 @@ function get_header(buffer)
   local msg_type = buffer(4, 4):le_uint()
   if header_len == 24 then
     bin_offset = buffer(20, 4):le_uint() -- if NHD-805/806 legacy protocol 30 30 30 30 aka "0000"
-    status_code =  buffer(16, 2):le_uint()
+    status_code =  buffer(16, 2):le_uint() 
   else
     encrypt_xml = buffer(16, 1):le_uint()
   end
@@ -234,13 +222,13 @@ function process_header(buffer, headers_tree)
   header:add_le(channel_id, buffer(12, 1))
   header:add_le(stream_id, buffer(13, 1))
         :append_text(stream_text)
-  header:add_le(unknown, buffer(14, 1))
+  header:add_le(unknown, buffer(14, 1))        
   header:add_le(msg_handle, buffer(15, 1))
 
   header:add_le(message_class, buffer(18, 2)):append_text(" (" .. header_data.class .. ")")
-
+  
   if header_data.header_len == 24 then
-    header:add_le(status_code, buffer(16, 2))
+    header:add_le(status_code, buffer(16, 2))    
     header:add_le(f_bin_offset, buffer(20, 4))
   else
     header:add_le(encrypt_xml, buffer(16, 1))

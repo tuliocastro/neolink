@@ -12,10 +12,8 @@ impl BcCamera {
         let get = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_GET_GENERAL,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                response_code: 0,
-                stream_type: 0,
+                client_idx: 0,
+                encrypted: true,
                 class: 0x6414,
             },
             body: BcBody::ModernMsg(ModernMsg::default()),
@@ -25,8 +23,8 @@ impl BcCamera {
         let msg = sub_get_general.rx.recv_timeout(RX_TIMEOUT)?;
 
         if let BcBody::ModernMsg(ModernMsg {
-            payload:
-                Some(BcPayloads::BcXml(BcXml {
+            xml:
+                Some(BcXml {
                     system_general:
                         Some(SystemGeneral {
                             time_zone: Some(time_zone),
@@ -39,7 +37,7 @@ impl BcCamera {
                             ..
                         }),
                     ..
-                })),
+                }),
             ..
         }) = msg.body
         {
@@ -84,10 +82,8 @@ impl BcCamera {
         let set = Bc::new_from_xml(
             BcMeta {
                 msg_id: MSG_ID_SET_GENERAL,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                response_code: 0,
-                stream_type: 0,
+                client_idx: 0,
+                encrypted: true,
                 class: 0x6414,
             },
             BcXml {

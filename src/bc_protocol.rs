@@ -2,29 +2,22 @@ use self::connection::BcConnection;
 use self::media_packet::{MediaDataKind, MediaDataSubscriber};
 use crate::bc;
 use crate::bc::{model::*, xml::*};
-use crate::gst::GstOutputs;
-use adpcm::adpcm_to_pcm;
 use err_derive::Error;
 use log::*;
-use std::convert::TryInto;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use Md5Trunc::*;
 
-mod adpcm;
 mod connection;
 mod media_packet;
 mod time;
 
 pub struct BcCamera {
     address: SocketAddr,
-    channel_id: u8,
     connection: Option<BcConnection>,
     logged_in: bool,
-    message_num: AtomicU16,
 }
 
 use crate::Never;
@@ -34,7 +27,6 @@ type Result<T> = std::result::Result<T, Error>;
 const RX_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
-#[allow(clippy::large_enum_variant)]
 pub enum Error {
     #[error(display = "Communication error")]
     CommunicationError(#[error(source)] std::io::Error),
@@ -55,31 +47,16 @@ pub enum Error {
     DroppedConnection(#[error(source)] std::sync::mpsc::RecvError),
 
     #[error(display = "Timeout")]
-    Timeout,
+    Timeout(#[error(source)] std::sync::mpsc::RecvTimeoutError),
 
-    #[error(display = "Dropped connection")]
-    TimeoutDisconnected,
+    #[error(display = "Media")]
+    MediaPacket(#[error(source)] self::media_packet::Error),
 
     #[error(display = "Credential error")]
     AuthFailed,
 
-    #[error(display = "Failed to translate camera address")]
-    AddrResolutionError,
-
-    #[error(display = "ADPCM Decoding Error")]
-    AdpcmDecodingError(&'static str),
-
     #[error(display = "Other error")]
     Other(&'static str),
-}
-
-impl<'a> From<std::sync::mpsc::RecvTimeoutError> for Error {
-    fn from(k: std::sync::mpsc::RecvTimeoutError) -> Self {
-        match k {
-            std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
-            std::sync::mpsc::RecvTimeoutError::Disconnected => Error::TimeoutDisconnected,
-        }
-    }
 }
 
 impl Drop for BcCamera {
@@ -89,40 +66,22 @@ impl Drop for BcCamera {
 }
 
 impl BcCamera {
-    pub fn new_with_addr<T: ToSocketAddrs>(host: T, channel_id: u8) -> Result<Self> {
-        let addr_iter = match host.to_socket_addrs() {
-            Ok(iter) => iter,
-            Err(_) => return Err(Error::AddrResolutionError),
-        };
+    pub fn new_with_addr<T: ToSocketAddrs>(hostname: T) -> Result<Self> {
+        let address = hostname
+            .to_socket_addrs()?
+            .next()
+            .ok_or(Error::Other("Address resolution failed"))?;
 
-        for addr in addr_iter {
-            debug!("Trying {}", addr);
-            let conn = match BcConnection::new(addr, RX_TIMEOUT) {
-                Ok(conn) => conn,
-                Err(err) => match err {
-                    connection::Error::CommunicationError(ref err) => {
-                        debug!("Assuming timeout from {}", err);
-                        continue;
-                    }
-                    err => return Err(err.into()),
-                },
-            };
-
-            debug!("Success: {}", addr);
-            return Ok(Self {
-                address: addr,
-                connection: Some(conn),
-                message_num: AtomicU16::new(0),
-                channel_id,
-                logged_in: false,
-            });
-        }
-
-        Err(Error::Timeout)
+        Ok(Self {
+            address,
+            connection: None,
+            logged_in: false,
+        })
     }
 
-    pub fn new_message_num(&self) -> u16 {
-        self.message_num.fetch_add(1, Ordering::Relaxed)
+    pub fn connect(&mut self) -> Result<()> {
+        self.connection = Some(BcConnection::new(self.address, RX_TIMEOUT)?);
+        Ok(())
     }
 
     pub fn disconnect(&mut self) {
@@ -156,10 +115,8 @@ impl BcCamera {
         let legacy_login = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_LOGIN,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                stream_type: 0,
-                response_code: 0xdc03,
+                client_idx: 0,
+                encrypted: true,
                 class: 0x6514,
             },
             body: BcBody::LegacyMsg(LegacyMsg::LoginMsg {
@@ -171,15 +128,14 @@ impl BcCamera {
         sub_login.send(legacy_login)?;
 
         let legacy_reply = sub_login.rx.recv_timeout(RX_TIMEOUT)?;
-
         let nonce;
         match legacy_reply.body {
             BcBody::ModernMsg(ModernMsg {
-                payload:
-                    Some(BcPayloads::BcXml(BcXml {
+                xml:
+                    Some(BcXml {
                         encryption: Some(encryption),
                         ..
-                    })),
+                    }),
                 ..
             }) => {
                 nonce = encryption.nonce;
@@ -208,10 +164,8 @@ impl BcCamera {
         let modern_login = Bc::new_from_xml(
             BcMeta {
                 msg_id: MSG_ID_LOGIN,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                stream_type: 0,
-                response_code: 0,
+                client_idx: 0, // TODO
+                encrypted: true,
                 class: 0x6414,
             },
             BcXml {
@@ -232,11 +186,11 @@ impl BcCamera {
         let device_info;
         match modern_reply.body {
             BcBody::ModernMsg(ModernMsg {
-                payload:
-                    Some(BcPayloads::BcXml(BcXml {
+                xml:
+                    Some(BcXml {
                         device_info: Some(info),
                         ..
-                    })),
+                    }),
                 ..
             }) => {
                 // Login succeeded!
@@ -244,8 +198,8 @@ impl BcCamera {
                 device_info = info;
             }
             BcBody::ModernMsg(ModernMsg {
-                extension: None,
-                payload: None,
+                xml: None,
+                binary: None,
             }) => return Err(Error::AuthFailed),
             _ => {
                 return Err(Error::UnintelligibleReply {
@@ -255,70 +209,15 @@ impl BcCamera {
             }
         }
 
-        if let EncryptionProtocol::Aes(_) = connection.get_encrypted() {
-            // We setup the data for the AES key now
-            // as all subsequent communications will use it
-            let passwd = password.unwrap_or("");
-            let full_key = make_aes_key(&nonce, passwd);
-            connection.set_encrypted(EncryptionProtocol::Aes(Some(full_key)));
-        }
-
         Ok(device_info)
     }
 
     pub fn logout(&mut self) -> Result<()> {
         if self.logged_in {
-            // TODO: Send message ID 2
+            // TODO
         }
         self.logged_in = false;
         Ok(())
-    }
-
-    pub fn version(&self) -> Result<VersionInfo> {
-        let connection = self
-            .connection
-            .as_ref()
-            .expect("Must be connected to get version info");
-        let sub_version = connection.subscribe(MSG_ID_VERSION)?;
-
-        let version = Bc {
-            meta: BcMeta {
-                msg_id: MSG_ID_VERSION,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                stream_type: 0,
-                response_code: 0,
-                class: 0x6414, // IDK why
-            },
-            body: BcBody::ModernMsg(ModernMsg {
-                ..Default::default()
-            }),
-        };
-
-        sub_version.send(version)?;
-
-        let modern_reply = sub_version.rx.recv_timeout(RX_TIMEOUT)?;
-        let version_info;
-        match modern_reply.body {
-            BcBody::ModernMsg(ModernMsg {
-                payload:
-                    Some(BcPayloads::BcXml(BcXml {
-                        version_info: Some(info),
-                        ..
-                    })),
-                ..
-            }) => {
-                version_info = info;
-            }
-            _ => {
-                return Err(Error::UnintelligibleReply {
-                    reply: modern_reply,
-                    why: "Expected a VersionInfo message",
-                })
-            }
-        }
-
-        Ok(version_info)
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -328,10 +227,8 @@ impl BcCamera {
         let ping = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_PING,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                stream_type: 0,
-                response_code: 0,
+                client_idx: 0,
+                encrypted: true,
                 class: 0x6414,
             },
             body: BcBody::ModernMsg(ModernMsg {
@@ -346,32 +243,29 @@ impl BcCamera {
         Ok(())
     }
 
-    pub fn start_video(&self, data_outs: &mut GstOutputs, stream_name: &str) -> Result<Never> {
+    pub fn start_video(
+        &self,
+        data_out: &mut dyn Write,
+        stream_name: &str,
+        channel_id: u32,
+    ) -> Result<Never> {
         let connection = self
             .connection
             .as_ref()
             .expect("Must be connected to start video");
         let sub_video = connection.subscribe(MSG_ID_VIDEO)?;
 
-        let stream_num = match stream_name {
-            "mainStream" => 0,
-            "subStream" => 1,
-            _ => 0,
-        };
-
         let start_video = Bc::new_from_xml(
             BcMeta {
                 msg_id: MSG_ID_VIDEO,
-                channel_id: self.channel_id,
-                msg_num: self.new_message_num(),
-                stream_type: stream_num,
-                response_code: 0,
+                client_idx: 0, // TODO
+                encrypted: true,
                 class: 0x6414, // IDK why
             },
             BcXml {
                 preview: Some(Preview {
                     version: xml_ver(),
-                    channel_id: self.channel_id,
+                    channel_id,
                     handle: 0,
                     stream_type: stream_name.to_string(),
                 }),
@@ -384,26 +278,12 @@ impl BcCamera {
         let mut media_sub = MediaDataSubscriber::from_bc_sub(&sub_video);
 
         loop {
-            let binary_data = media_sub.next_media_packet()?;
+            let binary_data = media_sub.next_media_packet(RX_TIMEOUT)?;
             // We now have a complete interesting packet. Send it to gst.
             // Process the packet
             match binary_data.kind() {
                 MediaDataKind::VideoDataIframe | MediaDataKind::VideoDataPframe => {
-                    let media_format = binary_data.media_format();
-                    data_outs.set_format(media_format);
-                    data_outs.vidsrc.write_all(binary_data.body())?;
-                }
-                MediaDataKind::AudioDataAac => {
-                    let media_format = binary_data.media_format();
-                    data_outs.set_format(media_format);
-                    data_outs.audsrc.write_all(binary_data.body())?;
-                }
-                MediaDataKind::AudioDataAdpcm => {
-                    let media_format = binary_data.media_format();
-                    data_outs.set_format(media_format);
-                    let adpcm = binary_data.body();
-                    let pcm = adpcm_to_pcm(adpcm)?;
-                    data_outs.audsrc.write_all(&pcm)?;
+                    data_out.write_all(binary_data.body())?;
                 }
                 _ => {}
             };
@@ -429,14 +309,6 @@ fn md5_string(input: &str, trunc: Md5Trunc) -> String {
     let mut md5 = format!("{:X}\0", md5::compute(input));
     md5.replace_range(31.., if trunc == Truncate { "" } else { "\0" });
     md5
-}
-
-pub fn make_aes_key(nonce: &str, passwd: &str) -> [u8; 16] {
-    let key_phrase = format!("{}-{}", nonce, passwd);
-    let key_phrase_hash = format!("{:X}\0", md5::compute(&key_phrase))
-        .to_uppercase()
-        .into_bytes();
-    key_phrase_hash[0..16].try_into().unwrap()
 }
 
 #[test]
